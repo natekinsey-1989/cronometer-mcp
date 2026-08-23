@@ -52,9 +52,27 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/":
             return await call_next(request)
 
-        header_ok = request.headers.get("authorization", "") == f"Bearer {self._token}"
-        query_ok = request.query_params.get("token", "") == self._token
+        auth_header = request.headers.get("authorization", "")
+        query_token = request.query_params.get("token", "")
+        header_ok = auth_header == f"Bearer {self._token}"
+        query_ok = query_token == self._token
         if not (header_ok or query_ok):
+            # Log a REDACTED fingerprint only — never the actual secret or
+            # what was sent — so mismatches (wrong prefix, extra
+            # whitespace, stale token, etc.) can be diagnosed from Railway
+            # logs without exposing anything sensitive.
+            logger.warning(
+                "Rejected /mcp request. authorization_header_present=%s "
+                "authorization_header_len=%d starts_with_bearer_space=%s "
+                "query_token_present=%s query_token_len=%d "
+                "expected_token_len=%d",
+                bool(auth_header),
+                len(auth_header),
+                auth_header.startswith("Bearer "),
+                bool(query_token),
+                len(query_token),
+                len(self._token),
+            )
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 

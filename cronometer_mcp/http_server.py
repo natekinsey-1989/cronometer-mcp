@@ -38,6 +38,19 @@ from .server import mcp
 logger = logging.getLogger(__name__)
 
 
+def _extract_bearer_token(header_value: str) -> str:
+    """Pull the token out of an Authorization header, tolerating formatting
+    variance (missing space after "Bearer", different casing, or the raw
+    token with no "Bearer" prefix at all). Connector UIs that let a user
+    hand-type a header value are easy to get subtly wrong — this is safer
+    than requiring one exact byte-for-byte format.
+    """
+    value = header_value.strip()
+    if value[:6].lower() == "bearer":
+        value = value[6:].lstrip()
+    return value
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Reject any /mcp request that doesn't present the shared-secret token."""
 
@@ -54,7 +67,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         auth_header = request.headers.get("authorization", "")
         query_token = request.query_params.get("token", "")
-        header_ok = auth_header == f"Bearer {self._token}"
+        header_ok = bool(auth_header) and _extract_bearer_token(auth_header) == self._token
         query_ok = query_token == self._token
         if not (header_ok or query_ok):
             # Log a REDACTED fingerprint only — never the actual secret or

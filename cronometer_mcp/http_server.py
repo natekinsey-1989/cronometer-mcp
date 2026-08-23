@@ -26,6 +26,7 @@ import logging
 import os
 
 import uvicorn
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -67,6 +68,18 @@ def build_app():
             "Cronometer account. Set MCP_AUTH_TOKEN in the environment "
             "(e.g. Railway variables) and redeploy."
         )
+
+    # FastMCP is constructed in server.py with its default host="127.0.0.1",
+    # which silently turns on DNS-rebinding protection scoped to
+    # localhost/127.0.0.1 Host headers only — meant to protect a local dev
+    # server from a malicious webpage's requests. Deployed remotely, that
+    # same protection rejects every real request, since the Host header is
+    # our actual public domain, not localhost (this is exactly what caused
+    # "Invalid Host header" / 421 in production). We already gate every
+    # request with MCP_AUTH_TOKEN above, which is the auth boundary that
+    # actually matters for a remotely hosted server, so it's safe to turn
+    # this localhost-oriented check off here.
+    mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
     app = mcp.streamable_http_app()
 

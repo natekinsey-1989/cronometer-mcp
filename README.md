@@ -96,7 +96,7 @@ If you installed from source with `pip install -e .`, you can also use the full 
 | `get_food_log` | Individual food entries with macros + micros for a date range |
 | `get_daily_nutrition` | Daily macro totals (calories, protein, carbs, fat, fiber) |
 | `get_micronutrients` | Detailed vitamin/mineral breakdown with period averages |
-| `export_raw_csv` | Raw CSV export for any data type (servings, exercises, biometrics, etc.) |
+| `export_raw_csv` | Raw CSV export for any data type (servings, exercises, biometrics, etc.). Large exports page on whole rows via `offset` / `next_offset`; `metric` filters biometrics (e.g. `"weight"`) |
 
 ### Food Search & Diary Management
 

@@ -13,8 +13,11 @@ import io
 import json
 import logging
 import os
+import functools
 import pickle
 import re
+import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -48,6 +51,26 @@ UNIVERSAL_MEASURE_ID = 124399
 # Cronometer has a public request open to raise this; derive ranges from
 # what is actually parsed rather than hardcoding 8 in more places.
 DIARY_GROUP_SLOTS = 8
+
+# Minimum gap between automatic re-logins. Cronometer rate-limits logins
+# aggressively, so a session that dies again right after a fresh login is
+# reported rather than retried. Override with CRONOMETER_RELOGIN_COOLDOWN.
+DEFAULT_RELOGIN_COOLDOWN_SECONDS = 300
+
+# How Cronometer reports a dead session: a GWT //EX payload naming this
+# exception (HTTP 200), or a 401/403 on the export and REST endpoints.
+_SESSION_EXPIRED_MARKERS = ("NotLoggedInException", "Invalid or expired session")
+
+
+def _is_session_expired(exc: BaseException) -> bool:
+    """True if ``exc`` means Cronometer rejected the session."""
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        if resp is not None and resp.status_code in (401, 403):
+            return True
+    msg = str(exc)
+    return any(marker in msg for marker in _SESSION_EXPIRED_MARKERS)
+
 
 # GWT magic values — used as fallbacks if auto-discovery fails.
 DEFAULT_GWT_CONTENT_TYPE = "text/x-gwt-rpc; charset=UTF-8"
@@ -385,6 +408,14 @@ class CronometerClient:
         self._cookie_path = Path(
             os.environ.get("CRONOMETER_DATA_DIR", Path.home() / ".local" / "share" / "cronometer-mcp")
         ) / ".session_cookies"
+        self._relogin_cooldown = float(
+            os.environ.get(
+                "CRONOMETER_RELOGIN_COOLDOWN", DEFAULT_RELOGIN_COOLDOWN_SECONDS
+            )
+        )
+        self._last_relogin: float | None = None
+        self._relogin_lock = threading.Lock()
+        self._call_state = threading.local()
 
     def _get_anticsrf(self) -> str:
         """Step 1: Fetch the login page and extract the anti-CSRF token."""
@@ -601,6 +632,43 @@ class CronometerClient:
         self._diary_groups = None
         self._cookie_path.unlink(missing_ok=True)
         return False
+
+    def _reset_session(self) -> None:
+        """Forget the current session entirely so the next call logs in fresh."""
+        self._authenticated = False
+        self.session.cookies.clear()
+        self.nonce = None
+        self.user_id = None
+        self._diary_groups = None
+        self._cookie_path.unlink(missing_ok=True)
+
+    def _recover_session(self, call_started: float, exc: BaseException) -> None:
+        """Log in again after Cronometer rejected the session.
+
+        A long-running server holds one client for its whole life, and
+        authenticate() short-circuits once _authenticated is set, so without
+        this a session that expires server-side stays dead until restart.
+
+        Serialized across threads. If another call already re-logged in after
+        this one started, reuse that session instead of logging in again.
+        Refuses to re-login twice inside the cooldown window.
+        """
+        with self._relogin_lock:
+            last = self._last_relogin
+            if last is not None and last > call_started:
+                return
+            now = time.monotonic()
+            if last is not None and now - last < self._relogin_cooldown:
+                raise RuntimeError(
+                    "Cronometer session expired again "
+                    f"{int(now - last)}s after the last re-login; not retrying "
+                    f"within the {int(self._relogin_cooldown)}s cooldown to avoid "
+                    f"login rate limiting. Original error: {exc}"
+                ) from exc
+            logger.warning("Cronometer session expired; logging in again")
+            self._reset_session()
+            self._last_relogin = now
+            self.authenticate()
 
     def authenticate(self) -> None:
         """Full authentication flow: discover hashes, login, GWT auth."""
@@ -2773,3 +2841,48 @@ class CronometerClient:
             return items
 
         return items
+
+
+def _with_session_retry(fn):
+    """Retry a client call once, after a fresh login, if the session died.
+
+    Only the outermost client call retries: public methods call each other
+    (export_parsed -> export_raw, add_serving -> diary_groups), and letting
+    each layer retry would stack logins against Cronometer's rate limit.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        state = self._call_state
+        depth = getattr(state, "depth", 0)
+        if depth:
+            return fn(self, *args, **kwargs)
+        state.depth = 1
+        try:
+            started = time.monotonic()
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception as exc:
+                if not _is_session_expired(exc):
+                    raise
+                self._recover_session(started, exc)
+                return fn(self, *args, **kwargs)
+        finally:
+            state.depth = 0
+
+    wrapper._session_retry = True
+    return wrapper
+
+
+# Methods that must not be wrapped: authenticate() is what recovery calls.
+_NO_RETRY = {"authenticate"}
+
+for _name, _attr in list(vars(CronometerClient).items()):
+    if (
+        _name.startswith("_")
+        or _name in _NO_RETRY
+        or not callable(_attr)
+        or isinstance(_attr, (staticmethod, classmethod))
+    ):
+        continue
+    setattr(CronometerClient, _name, _with_session_retry(_attr))

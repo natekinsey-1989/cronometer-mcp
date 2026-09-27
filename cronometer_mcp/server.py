@@ -1,5 +1,7 @@
 """MCP server for Cronometer nutrition data."""
 
+import csv
+import io
 import json
 import logging
 import os
@@ -273,32 +275,98 @@ def export_raw_csv(
     export_type: str,
     start_date: str | None = None,
     end_date: str | None = None,
+    offset: int = 0,
+    metric: str | None = None,
 ) -> str:
     """Export raw CSV data from Cronometer for any data type.
 
-    Useful when you need the full unprocessed export.
+    Useful when you need the full unprocessed export. Large exports are
+    paged: each page holds whole rows plus the header, up to about 50,000
+    characters. If ``next_offset`` in the response is not null, call again
+    with ``offset=next_offset`` (same other arguments) for the next page.
 
     Args:
         export_type: One of 'servings', 'daily_summary', 'exercises',
                     'biometrics', 'notes'.
         start_date: Start date as YYYY-MM-DD (defaults to today).
         end_date: End date as YYYY-MM-DD (defaults to today).
+        offset: Index of the first data row to return (0 = first row).
+        metric: Biometrics only. Case-insensitive substring match on the
+                Metric column, e.g. "weight" returns only weight rows.
+
+    Returns JSON with: status, data (CSV text), total_rows, offset,
+    rows_returned, next_offset (null on the last page), truncated.
     """
     try:
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        if metric and export_type != "biometrics":
+            raise ValueError("metric filter only applies to export_type='biometrics'")
         client = _get_client()
         start = _parse_date(start_date)
         end = _parse_date(end_date)
         raw = client.export_raw(export_type, start, end)
-        if len(raw) > 50000:
-            return json.dumps({
-                "status": "success",
-                "truncated": True,
-                "total_chars": len(raw),
-                "data": raw[:50000] + "\n... (truncated)",
-            })
-        return json.dumps({"status": "success", "data": raw})
+        return json.dumps(_page_csv(raw, offset=offset, metric=metric))
     except Exception as e:
         return json.dumps({"status": "error", "message": f"{type(e).__name__}: {e}"})
+
+
+EXPORT_PAGE_MAX_CHARS = 50000
+
+
+def _page_csv(
+    raw: str,
+    offset: int = 0,
+    metric: str | None = None,
+    max_chars: int = EXPORT_PAGE_MAX_CHARS,
+) -> dict:
+    """Split a CSV export into a page of whole rows, header repeated.
+
+    Rows are parsed with the csv module, so quoted fields containing commas
+    or newlines (food names, notes) are never split mid-row.
+    """
+    rows = list(csv.reader(io.StringIO(raw)))
+    if not rows:
+        return {"status": "success", "data": "", "total_rows": 0, "offset": offset,
+                "rows_returned": 0, "next_offset": None, "truncated": False}
+    header, body = rows[0], [r for r in rows[1:] if r]
+
+    if metric:
+        try:
+            col = header.index("Metric")
+        except ValueError:
+            raise ValueError(f"export has no Metric column (columns: {header})")
+        needle = metric.lower()
+        body = [r for r in body if col < len(r) and needle in r[col].lower()]
+
+    def render(r: list[str]) -> str:
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerow(r)
+        return buf.getvalue()
+
+    out = [render(header)]
+    size = len(out[0])
+    i = offset
+    while i < len(body):
+        line = render(body[i])
+        if i > offset and size + len(line) > max_chars:
+            break
+        out.append(line)
+        size += len(line)
+        i += 1
+
+    total = len(body)
+    returned = max(0, i - offset)
+    next_offset = i if i < total else None
+    return {
+        "status": "success",
+        "data": "".join(out),
+        "total_rows": total,
+        "offset": offset,
+        "rows_returned": returned,
+        "next_offset": next_offset,
+        "truncated": next_offset is not None,
+    }
 
 
 # Legacy fallback only. Diary group slots are user-configurable, so these
